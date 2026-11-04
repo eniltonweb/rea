@@ -72,7 +72,6 @@ const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const FRAME_PAGE_BYTES = 64 * 1024;
 // Bound admitted descriptor input bytes and concurrent file/socket handles.
 const MAX_DESCRIPTOR_CANDIDATES = MAX_FRAME_BYTES / MAX_DESCRIPTOR_BYTES;
-const DISCOVERY_CONCURRENCY = 8;
 type AuthenticatedRequestBytes = string & {
   readonly __authenticatedRequestBytes: unique symbol;
 };
@@ -167,22 +166,7 @@ class CutterBridgeResponseFrames {
 const mapDiscovery = async <Input, Output>(
   inputs: readonly Input[],
   operation: (input: Input) => Promise<Output>,
-): Promise<Output[]> => {
-  const results = new Array<Output>(inputs.length);
-  let next = 0;
-  await Promise.all(
-    Array.from(
-      { length: Math.min(inputs.length, DISCOVERY_CONCURRENCY) },
-      async () => {
-        while (next < inputs.length) {
-          const index = next++;
-          results[index] = await operation(inputs[index]!);
-        }
-      },
-    ),
-  );
-  return results;
-};
+): Promise<Output[]> => Promise.all(inputs.map((input) => operation(input)));
 export type CutterBridgeExecutionState =
   | "not_started"
   | "complete"
