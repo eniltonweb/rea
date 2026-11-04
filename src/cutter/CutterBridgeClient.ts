@@ -581,14 +581,18 @@ export class CutterBridgeClient {
   ): Promise<void> {
     const pending = this.#pendingAcknowledgements.get(descriptor.session_id);
     if (pending === undefined) return;
-    for (const requestId of pending) {
-      if (!(await this.#acknowledgeCompletion(descriptor, requestId)))
-        throw new AnalysisCapabilityUnavailableError(
-          "cutter",
-          "cutter_command",
-          "A retained Cutter completion receipt could not be acknowledged; no new command was sent.",
-        );
-    }
+    const results = await Promise.all(
+      Array.from(pending).map((requestId) =>
+        this.#acknowledgeCompletion(descriptor, requestId),
+      ),
+    );
+
+    if (results.some((acknowledged) => !acknowledged))
+      throw new AnalysisCapabilityUnavailableError(
+        "cutter",
+        "cutter_command",
+        "A retained Cutter completion receipt could not be acknowledged; no new command was sent.",
+      );
   }
 
   async #find(sessionId: string): Promise<z.infer<typeof descriptorSchema>> {
