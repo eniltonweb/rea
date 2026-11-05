@@ -953,19 +953,37 @@ export class FlutterBuildProvider {
         snapshot.root,
         new OwnedFileHandle(await openFile(imagePath, "r")),
       );
-      while (imageLength < image.length) {
-        if (signal?.aborted === true)
-          return err(new AnalysisCancelledError("inspect_dart_aot"));
-        const result = await file.handle.read(
-          image,
-          imageLength,
-          image.length - imageLength,
-          null,
+
+      const CHUNK_SIZE = 16 * 1024 * 1024;
+      const promises: Promise<number>[] = [];
+      for (let offset = 0; offset < image.length; offset += CHUNK_SIZE) {
+        const length = Math.min(CHUNK_SIZE, image.length - offset);
+        promises.push(
+          (async () => {
+            let chunkOffset = 0;
+            while (chunkOffset < length) {
+              if (signal?.aborted === true) return 0;
+              const result = await file.handle.read(
+                image,
+                offset + chunkOffset,
+                length - chunkOffset,
+                offset + chunkOffset,
+              );
+              if (result.bytesRead === 0) break;
+              chunkOffset += result.bytesRead;
+            }
+            return chunkOffset;
+          })(),
         );
-        signal?.throwIfAborted();
-        if (result.bytesRead === 0) break;
-        imageLength += result.bytesRead;
       }
+
+      const bytesReadArray = await Promise.all(promises);
+      if (signal?.aborted === true)
+        return err(new AnalysisCancelledError("inspect_dart_aot"));
+
+      imageLength = bytesReadArray.reduce((acc, bytes) => acc + bytes, 0);
+      signal?.throwIfAborted();
+
       await this.releaseResource(snapshot.root, file);
     }
     signal?.throwIfAborted();
