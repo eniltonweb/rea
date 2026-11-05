@@ -359,7 +359,7 @@ const collectDynamicProperty = (
 };
 
 /**
- * `with (o) { … }` and `eval("…")` decide at runtime which bindings exist, so
+ * `with (o) { … }` and `eval` calls decide at runtime which bindings exist, so
  * every name inside them is unresolvable statically. Recording the frontier
  * is what keeps the analyzer from presenting an empty or partial resolution as
  * an observed fact — silence here would read as "nothing to resolve".
