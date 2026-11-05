@@ -57,19 +57,33 @@ export class CutterBridgeService {
   }
 
   async #retryPendingCleanup(): Promise<Result<null, AnalysisError>> {
-    for (const [requestId, pending] of this.#pendingCleanup) {
-      const confirmCommandCompletion = this.client.confirmCommandCompletion;
-      if (confirmCommandCompletion === undefined) return err(pending.failure);
-      const receipt = await confirmCommandCompletion.call(
-        this.client,
-        pending.sessionId,
-        requestId,
-        pending.completionToken,
-      );
-      if (!receipt.ok || !receipt.value) return err(pending.failure);
-      const { failure } = pending;
-      failure.resolveCleanup();
-      this.#pendingCleanup.delete(requestId);
+    const confirmCommandCompletion = this.client.confirmCommandCompletion;
+    if (confirmCommandCompletion === undefined) {
+      for (const [_, pending] of this.#pendingCleanup) {
+        return err(pending.failure);
+      }
+      return ok(null);
+    }
+
+    const promises = Array.from(this.#pendingCleanup.entries()).map(
+      async ([requestId, pending]) => {
+        const receipt = await confirmCommandCompletion.call(
+          this.client,
+          pending.sessionId,
+          requestId,
+          pending.completionToken,
+        );
+        if (!receipt.ok || !receipt.value) return err(pending.failure);
+        const { failure } = pending;
+        failure.resolveCleanup();
+        this.#pendingCleanup.delete(requestId);
+        return ok(null);
+      },
+    );
+
+    const results = await Promise.all(promises);
+    for (const result of results) {
+      if (!result.ok) return result;
     }
     return ok(null);
   }
