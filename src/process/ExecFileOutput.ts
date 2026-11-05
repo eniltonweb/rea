@@ -155,6 +155,7 @@ export const execFileBytes = (
           : { killSignal: stopSignal }),
         encoding: "buffer",
         maxBuffer: options.maxBuffer ?? Number.POSITIVE_INFINITY,
+        shell: false,
       },
       (error, stdout, stderr) => {
         signal?.removeEventListener("abort", onAbort);
