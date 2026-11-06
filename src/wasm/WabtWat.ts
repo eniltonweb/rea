@@ -37,6 +37,41 @@ const moduleNames = (bytes: Uint8Array): string[] => {
   return names;
 };
 
+const processWabtForm = (
+  form: string,
+  forms: string[],
+  imports: string[],
+  exports: string[],
+  customSectionNames: string[],
+  debugModuleNames: string[],
+) => {
+  if (
+    /^\((?:type|rec|import|export|func|table|memory|global|tag)\s/u.test(form)
+  )
+    forms.push(form);
+  if (/^\(import\s/u.test(form)) imports.push(form);
+  else if (/^\(export\s/u.test(form)) exports.push(form);
+  else if (/^\(@custom\s/u.test(form)) {
+    const prefix = /^\(@custom\s+"/u.exec(form);
+    if (prefix === null)
+      throw new Error("Unsupported WABT custom-section name.");
+    const nameString = watString(form, prefix[0].length);
+    // A WASM name is length-delimited UTF-8; leading U+FEFF is name data.
+    const name = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(nameString.bytes);
+    customSectionNames.push(name);
+    if (name === "name") {
+      const payloadPrefix = /^\s+"/u.exec(form.slice(nameString.end));
+      if (payloadPrefix === null)
+        throw new Error("Unsupported WABT name-section payload.");
+      const payload = watString(form, nameString.end + payloadPrefix[0].length);
+      debugModuleNames.push(...moduleNames(payload.bytes));
+    }
+  }
+};
+
 /** Extract exact top-level WABT WAT forms; no raw WASM decoding or import/export name unescaping. */
 export const parseWabtWat = (text: string) => {
   if (!/^\(module(?:\s|\))/u.test(text))
@@ -96,37 +131,14 @@ export const parseWabtWat = (text: string) => {
       if (depth === 2) start = index;
     } else if (char === ")") {
       if (depth === 2) {
-        const form = text.slice(start, index + 1);
-        if (
-          /^\((?:type|rec|import|export|func|table|memory|global|tag)\s/u.test(
-            form,
-          )
-        )
-          forms.push(form);
-        if (/^\(import\s/u.test(form)) imports.push(form);
-        else if (/^\(export\s/u.test(form)) exports.push(form);
-        else if (/^\(@custom\s/u.test(form)) {
-          const prefix = /^\(@custom\s+"/u.exec(form);
-          if (prefix === null)
-            throw new Error("Unsupported WABT custom-section name.");
-          const nameString = watString(form, prefix[0].length);
-          // A WASM name is length-delimited UTF-8; leading U+FEFF is name data.
-          const name = new TextDecoder("utf-8", {
-            fatal: true,
-            ignoreBOM: true,
-          }).decode(nameString.bytes);
-          customSectionNames.push(name);
-          if (name === "name") {
-            const payloadPrefix = /^\s+"/u.exec(form.slice(nameString.end));
-            if (payloadPrefix === null)
-              throw new Error("Unsupported WABT name-section payload.");
-            const payload = watString(
-              form,
-              nameString.end + payloadPrefix[0].length,
-            );
-            debugModuleNames.push(...moduleNames(payload.bytes));
-          }
-        }
+        processWabtForm(
+          text.slice(start, index + 1),
+          forms,
+          imports,
+          exports,
+          customSectionNames,
+          debugModuleNames,
+        );
       }
       if (--depth < 0) throw new Error("Unbalanced WABT WAT output.");
       if (depth === 0) closed = true;
