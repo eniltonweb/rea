@@ -62,6 +62,7 @@ const resolveSuperclass = (
 };
 
 /** Decode Objective-C protocol lists, classlists, methods, and ivars into `result`. */
+// oxlint-disable-next-line max-lines-per-function -- Decoding logic operates heavily on shared state closures avoiding many parameter passing for each read method.
 export const decodeObjcDispatchFacets = (input: {
   bytes: Buffer;
   sections: readonly Section[];
@@ -256,92 +257,87 @@ export const decodeObjcDispatchFacets = (input: {
       }
     }
   }
-  const visited = new Set<string>();
-  const readClass = (address: bigint, meta = false) => {
-    if (address === 0n || visited.has(hex(address)) || !budget.admit()) return;
-    visited.add(hex(address));
-    const ro = read.pointer(address + 32n) & ~7n;
-    const name = read.string(read.pointer(ro + 24n));
-    if (name.length === 0)
-      throw new TypeError(
-        `Objective-C class at ${hex(address)} has an empty name`,
-      );
-    const root = (read.u32(ro) & 2) !== 0;
-    const superclass = resolveSuperclass(read, address, name, failures);
-    if (superclass.name === null && superclass.address === null && !root)
-      failures.push(
-        `Superclass of ${name} requires external binding resolution`,
-      );
-    const ivarList = read.pointer(ro + 48n);
-    let ivarCount: number | null = meta ? null : 0;
-    if (ivarList !== 0n && !meta) {
-      const stride = read.u32(ivarList),
-        count = read.u32(ivarList + 4n);
-      if (stride !== 32)
-        throw new TypeError("Unsupported Objective-C ivar entry size");
-      ivarCount = count;
-      for (let index = 0; index < count; index++) {
-        if (!budget.admit()) break;
-        const entry = ivarList + 8n + BigInt(index * stride);
-        const encodedOffset = read.pointer(entry);
-        let value: number | null = null;
-        try {
-          value = read.u32(encodedOffset);
-        } catch (cause: unknown) {
-          // Unresolved offsets are recorded; the cause adds no identity.
-          void cause;
-          failures.push(`Unresolved ivar offset pointer ${hex(encodedOffset)}`);
-        }
-        const alignment = read.u32(entry + 24n);
-        result.objc_ivars.push({
-          class_name: name,
-          name: read.string(read.pointer(entry + 8n)),
-          type_encoding: read.string(read.pointer(entry + 16n)),
-          offset: value,
-          size: read.u32(entry + 28n),
-          // objc4 ivar_t::alignment(): ~0 means word alignment (8 for 32-byte entries).
-          alignment:
-            alignment === 0xffffffff
-              ? 8
-              : alignment < 31
-                ? 2 ** alignment
-                : null,
-          location: read.location(entry),
-          decode:
-            value === null
-              ? { status: "partial", reason: "ivar_offset_pointer_unresolved" }
-              : decoded,
-          evidence: read.evidence(
-            entry,
-            "Objective-C ivar entry and encoded offset storage",
-          ),
-        });
+  const mapMethods = (name: string, meta: boolean) =>
+    result.objc_dispatch_implementations
+      .filter(
+        (item) =>
+          item.class_name === name &&
+          item.method_type === (meta ? "class" : "instance"),
+      )
+      .map((item) => ({
+        selector: item.selector,
+        method_type: item.method_type,
+        address:
+          item.implementation_address !== null &&
+          BigInt(item.implementation_address) <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(BigInt(item.implementation_address))
+            : null,
+        is_required: null,
+        is_optional: null,
+      }));
+
+  const readIvars = (ivarList: bigint, name: string) => {
+    const stride = read.u32(ivarList),
+      count = read.u32(ivarList + 4n);
+    if (stride !== 32)
+      throw new TypeError("Unsupported Objective-C ivar entry size");
+    for (let index = 0; index < count; index++) {
+      if (!budget.admit()) break;
+      const entry = ivarList + 8n + BigInt(index * stride);
+      const encodedOffset = read.pointer(entry);
+      let value: number | null = null;
+      try {
+        value = read.u32(encodedOffset);
+      } catch (cause: unknown) {
+        // Unresolved offsets are recorded; the cause adds no identity.
+        void cause;
+        failures.push(`Unresolved ivar offset pointer ${hex(encodedOffset)}`);
       }
+      const alignment = read.u32(entry + 24n);
+      result.objc_ivars.push({
+        class_name: name,
+        name: read.string(read.pointer(entry + 8n)),
+        type_encoding: read.string(read.pointer(entry + 16n)),
+        offset: value,
+        size: read.u32(entry + 28n),
+        // objc4 ivar_t::alignment(): ~0 means word alignment (8 for 32-byte entries).
+        alignment:
+          alignment === 0xffffffff
+            ? 8
+            : alignment < 31
+              ? 2 ** alignment
+              : null,
+        location: read.location(entry),
+        decode:
+          value === null
+            ? { status: "partial", reason: "ivar_offset_pointer_unresolved" }
+            : decoded,
+        evidence: read.evidence(
+          entry,
+          "Objective-C ivar entry and encoded offset storage",
+        ),
+      });
     }
-    methods(read.pointer(ro + 32n), name, meta ? "class" : "instance");
+    return count;
+  };
+
+  const visited = new Set<string>();
+  const readClassImpl = (input: {
+    address: bigint;
+    ro: bigint;
+    name: string;
+    root: boolean;
+    meta: boolean;
+    superclass: { name: string | null; address: string | null };
+    ivarCount: number | null;
+  }) => {
+    const { address, ro, name, root, meta, superclass, ivarCount } = input;
     result.objc_classes.push({
       name,
       super_class: superclass.name,
       is_meta_class: meta,
       is_root_class: root,
-      methods: result.objc_dispatch_implementations
-        .filter(
-          (item) =>
-            item.class_name === name &&
-            item.method_type === (meta ? "class" : "instance"),
-        )
-        .map((item) => ({
-          selector: item.selector,
-          method_type: item.method_type,
-          address:
-            item.implementation_address !== null &&
-            BigInt(item.implementation_address) <=
-              BigInt(Number.MAX_SAFE_INTEGER)
-              ? Number(BigInt(item.implementation_address))
-              : null,
-          is_required: null,
-          is_optional: null,
-        })),
+      methods: mapMethods(name, meta),
       properties: readObjcPropertiesOf(read, read.pointer(ro + 64n), {
         owner: name,
         admit: () => budget.admit(),
@@ -363,15 +359,40 @@ export const decodeObjcDispatchFacets = (input: {
         "Objective-C class and class_ro_t records",
       ),
     });
-    if (!meta) {
-      try {
-        readClass(read.pointer(address), true);
-      } catch (cause) {
-        failures.push(
-          `Metaclass of ${name}: ${cause instanceof Error ? cause.message : String(cause)}`,
-        );
-      }
+  };
+
+  const readClassMetaclass = (address: bigint, name: string) => {
+    try {
+      readClass(read.pointer(address), true);
+    } catch (cause) {
+      failures.push(
+        `Metaclass of ${name}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
     }
+  };
+
+  const readClass = (address: bigint, meta = false) => {
+    if (address === 0n || visited.has(hex(address)) || !budget.admit()) return;
+    visited.add(hex(address));
+    const ro = read.pointer(address + 32n) & ~7n;
+    const name = read.string(read.pointer(ro + 24n));
+    if (name.length === 0)
+      throw new TypeError(
+        `Objective-C class at ${hex(address)} has an empty name`,
+      );
+    const root = (read.u32(ro) & 2) !== 0;
+    const superclass = resolveSuperclass(read, address, name, failures);
+    if (superclass.name === null && superclass.address === null && !root)
+      failures.push(
+        `Superclass of ${name} requires external binding resolution`,
+      );
+    const ivarList = read.pointer(ro + 48n);
+    let ivarCount: number | null = meta ? null : 0;
+    if (ivarList !== 0n && !meta) ivarCount = readIvars(ivarList, name);
+    methods(read.pointer(ro + 32n), name, meta ? "class" : "instance");
+    readClassImpl({ address, ro, name, root, meta, superclass, ivarCount });
+
+    if (!meta) readClassMetaclass(address, name);
   };
   for (const section of sections.filter(
     ({ name }) => name === "__objc_classlist",
