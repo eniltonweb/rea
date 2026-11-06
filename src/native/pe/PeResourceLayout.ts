@@ -34,33 +34,12 @@ interface Section {
 const virtualExtent = (section: Section): number =>
   section.virtualSize === 0 ? section.size : section.virtualSize;
 
-/** Header admission and unambiguous file-backed RVA mapping, independent of section names. */
-export const readPeResourceLayout = (bytes: Buffer) => {
-  requirePeRange(bytes, 0, 64);
-  if (bytes.readUInt16LE(0) !== 0x5a4d) peFailure("Expected an MZ PE image.");
-  const pe = bytes.readUInt32LE(60);
-  requirePeRange(bytes, pe, 24);
-  if (bytes.readUInt32LE(pe) !== 0x4550) peFailure("Expected a PE signature.");
-  const sectionCount = bytes.readUInt16LE(pe + 6);
-  const optionalSize = bytes.readUInt16LE(pe + 20);
-  const optional = pe + 24;
-  requirePeRange(bytes, optional, optionalSize);
-  if (optionalSize < 64) peFailure("Truncated PE optional header.");
-  const magic = bytes.readUInt16LE(optional);
-  if (magic !== 0x10b && magic !== 0x20b)
-    peFailure("Unsupported PE optional header magic.");
-  const countAt = magic === 0x10b ? 92 : 108;
-  const directoriesAt = countAt + 4;
-  if (optionalSize < directoriesAt)
-    peFailure("Truncated PE data directory count.");
-  const directoryCount = bytes.readUInt32LE(optional + countAt);
-  if (directoryCount > Math.floor((optionalSize - directoriesAt) / 8))
-    peFailure("PE directory count exceeds its optional header.");
-  const headerSize = bytes.readUInt32LE(optional + 60);
-  const table = optional + optionalSize;
-  requirePeRange(bytes, table, sectionCount * 40);
-  if (headerSize < table + sectionCount * 40 || headerSize > bytes.length)
-    peFailure("Invalid PE SizeOfHeaders.");
+const readSections = (
+  bytes: Buffer,
+  table: number,
+  sectionCount: number,
+  headerSize: number,
+): Section[] => {
   const sections: Section[] = [];
   for (let index = 0; index < sectionCount; index++) {
     const at = table + index * 40;
@@ -92,7 +71,15 @@ export const readPeResourceLayout = (bytes: Buffer) => {
     )
       peFailure("PE sections have overlapping raw file ranges.");
   }
-  const map = (rva: number, size: number): number => {
+  return sections;
+};
+
+const createResourceMapper = (
+  bytes: Buffer,
+  sections: Section[],
+  headerSize: number,
+) => {
+  return (rva: number, size: number): number => {
     if (rva + size > 0x100000000) peFailure("Resource RVA range overflows.");
     const candidates = sections.filter(
       (section) =>
@@ -134,6 +121,37 @@ export const readPeResourceLayout = (bytes: Buffer) => {
     requirePeRange(bytes, offset, size);
     return offset;
   };
+};
+
+/** Header admission and unambiguous file-backed RVA mapping, independent of section names. */
+export const readPeResourceLayout = (bytes: Buffer) => {
+  requirePeRange(bytes, 0, 64);
+  if (bytes.readUInt16LE(0) !== 0x5a4d) peFailure("Expected an MZ PE image.");
+  const pe = bytes.readUInt32LE(60);
+  requirePeRange(bytes, pe, 24);
+  if (bytes.readUInt32LE(pe) !== 0x4550) peFailure("Expected a PE signature.");
+  const sectionCount = bytes.readUInt16LE(pe + 6);
+  const optionalSize = bytes.readUInt16LE(pe + 20);
+  const optional = pe + 24;
+  requirePeRange(bytes, optional, optionalSize);
+  if (optionalSize < 64) peFailure("Truncated PE optional header.");
+  const magic = bytes.readUInt16LE(optional);
+  if (magic !== 0x10b && magic !== 0x20b)
+    peFailure("Unsupported PE optional header magic.");
+  const countAt = magic === 0x10b ? 92 : 108;
+  const directoriesAt = countAt + 4;
+  if (optionalSize < directoriesAt)
+    peFailure("Truncated PE data directory count.");
+  const directoryCount = bytes.readUInt32LE(optional + countAt);
+  if (directoryCount > Math.floor((optionalSize - directoriesAt) / 8))
+    peFailure("PE directory count exceeds its optional header.");
+  const headerSize = bytes.readUInt32LE(optional + 60);
+  const table = optional + optionalSize;
+  requirePeRange(bytes, table, sectionCount * 40);
+  if (headerSize < table + sectionCount * 40 || headerSize > bytes.length)
+    peFailure("Invalid PE SizeOfHeaders.");
+  const sections = readSections(bytes, table, sectionCount, headerSize);
+  const map = createResourceMapper(bytes, sections, headerSize);
   const directoryAt = optional + directoriesAt + 16;
   const rva = directoryCount > 2 ? bytes.readUInt32LE(directoryAt) : 0;
   const size = directoryCount > 2 ? bytes.readUInt32LE(directoryAt + 4) : 0;
