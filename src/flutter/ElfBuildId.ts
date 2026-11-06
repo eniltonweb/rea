@@ -123,48 +123,79 @@ export const readElfBuildIds = async (
     }
   }
   const align4 = (value: number): number => Math.ceil(value / 4) * 4;
-  for (const range of ranges.values()) {
-    const notes = await read(range.offset, range.size);
-    if (notes === null)
+
+  const sortedRanges = Array.from(ranges.values()).sort(
+    (a, b) => a.offset - b.offset,
+  );
+  const coalesced: {
+    offset: number;
+    size: number;
+    ranges: { offset: number; size: number }[];
+  }[] = [];
+  for (const r of sortedRanges) {
+    if (coalesced.length === 0) {
+      coalesced.push({ offset: r.offset, size: r.size, ranges: [r] });
+    } else {
+      const last = coalesced[coalesced.length - 1]!;
+      if (r.offset <= last.offset + last.size) {
+        const newEnd = Math.max(last.offset + last.size, r.offset + r.size);
+        last.size = newEnd - last.offset;
+        last.ranges.push(r);
+      } else {
+        coalesced.push({ offset: r.offset, size: r.size, ranges: [r] });
+      }
+    }
+  }
+
+  for (const c of coalesced) {
+    const coalescedNotes = await read(c.offset, c.size);
+    if (coalescedNotes === null)
       return failure(
         "ELF notes exceed the 8 MiB metadata budget or are truncated",
       );
-    let yieldedAt = 0;
-    for (let at = 0; at < notes.length;) {
-      if (at - yieldedAt >= 64 * 1024) {
-        await yieldToEventLoop();
-        signal?.throwIfAborted();
-        yieldedAt = at;
+
+    for (const range of c.ranges) {
+      const notes = coalescedNotes.subarray(
+        range.offset - c.offset,
+        range.offset - c.offset + range.size,
+      );
+      let yieldedAt = 0;
+      for (let at = 0; at < notes.length;) {
+        if (at - yieldedAt >= 64 * 1024) {
+          await yieldToEventLoop();
+          signal?.throwIfAborted();
+          yieldedAt = at;
+        }
+        if (notes.length - at < 12) {
+          if (notes.subarray(at).some((byte) => byte !== 0))
+            return failure("ELF note header is truncated");
+          break;
+        }
+        const namesz = notes.readUInt32LE(at);
+        const descsz = notes.readUInt32LE(at + 4);
+        const type = notes.readUInt32LE(at + 8);
+        const descriptor = at + 12 + align4(namesz);
+        const end = descriptor + descsz;
+        if (end > notes.length)
+          return failure("ELF note descriptor exceeds its declared note range");
+        if (
+          namesz === 4 &&
+          type === 3 &&
+          notes.subarray(at + 12, at + 16).equals(Buffer.from("GNU\0"))
+        ) {
+          if (descsz < 4 || descsz > 64)
+            return failure(
+              "GNU build-id descriptor exceeds the 4–64 byte projection",
+            );
+          const candidate = notes.subarray(descriptor, end).toString("hex");
+          if (!candidates.has(candidate) && candidates.size === MAX_BUILD_IDS)
+            return failure(
+              "ELF build-id candidates exceed the 64-value evidence budget",
+            );
+          candidates.add(candidate);
+        }
+        at = align4(end);
       }
-      if (notes.length - at < 12) {
-        if (notes.subarray(at).some((byte) => byte !== 0))
-          return failure("ELF note header is truncated");
-        break;
-      }
-      const namesz = notes.readUInt32LE(at);
-      const descsz = notes.readUInt32LE(at + 4);
-      const type = notes.readUInt32LE(at + 8);
-      const descriptor = at + 12 + align4(namesz);
-      const end = descriptor + descsz;
-      if (end > notes.length)
-        return failure("ELF note descriptor exceeds its declared note range");
-      if (
-        namesz === 4 &&
-        type === 3 &&
-        notes.subarray(at + 12, at + 16).equals(Buffer.from("GNU\0"))
-      ) {
-        if (descsz < 4 || descsz > 64)
-          return failure(
-            "GNU build-id descriptor exceeds the 4–64 byte projection",
-          );
-        const candidate = notes.subarray(descriptor, end).toString("hex");
-        if (!candidates.has(candidate) && candidates.size === MAX_BUILD_IDS)
-          return failure(
-            "ELF build-id candidates exceed the 64-value evidence budget",
-          );
-        candidates.add(candidate);
-      }
-      at = align4(end);
     }
   }
   signal?.throwIfAborted();
