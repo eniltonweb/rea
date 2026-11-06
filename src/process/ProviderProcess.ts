@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import type { Readable, Writable } from "node:stream";
+import spawn from "cross-spawn";
 
 import { WindowsOwnedProcess } from "../windows/WindowsOwnedProcess.js";
 

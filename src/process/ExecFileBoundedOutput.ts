@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import spawn from "cross-spawn";
 
 export interface BoundedCommandOutput {
   readonly exitCode: string | number | null;
@@ -44,8 +44,8 @@ export const execFileBoundedOutput = (
           stream.tail = Buffer.concat([stream.tail, rest]).subarray(-tailLimit);
         if (stream.total > options.limit) outputTruncated = true;
       };
-    child.stdout.on("data", capture(stdout));
-    child.stderr.on("data", capture(stderr));
+    child.stdout?.on("data", capture(stdout));
+    child.stderr?.on("data", capture(stderr));
     let spawnError: NodeJS.ErrnoException | undefined;
     child.on("error", (error: NodeJS.ErrnoException) => {
       spawnError = error;
