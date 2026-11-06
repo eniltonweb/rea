@@ -81,29 +81,17 @@ const limitations = [
   "This example retains export and return-shape facts only; other application and semantic relationships are omitted.",
 ];
 
-const exampleEvidence = (property: "count" | "total") => {
-  const metadata = captures[property];
-  const source = `export default () => ({ kind: "results", ${property}: query() });\n`;
-  const artifact = createWebTextArtifact(source, "text/javascript");
-  const ir = analyzeJavaScriptSemantics(source);
-  const link = ir.moduleLinks.find(
-    ({ exportedName }) => exportedName === "default",
-  );
-  if (link === undefined)
-    throw new Error("Example source must define a default export");
-  const coverage =
-    ir.coverage.status === "complete"
-      ? completeApplicationCoverage()
-      : partialApplicationCoverage([], ir.coverage.omittedCount);
-  const projection = projectJavaScriptExportReturnShapes({
-    ir,
-    link,
-    modulePath,
-    baseCoverage: coverage,
-  });
-  if (projection === null)
-    throw new Error("Example export must retain return shapes");
-  const evidence = {
+const createBaseEvidence = (
+  artifact: ReturnType<typeof createWebTextArtifact>,
+  link: NonNullable<
+    ReturnType<typeof analyzeJavaScriptSemantics>["moduleLinks"][number]
+  >,
+  coverage:
+    | ReturnType<typeof completeApplicationCoverage>
+    | ReturnType<typeof partialApplicationCoverage>,
+  limitations: readonly string[],
+) => {
+  return {
     artifact: {
       available: true,
       artifact_id: `art_${artifact.sha256}`,
@@ -111,7 +99,11 @@ const exampleEvidence = (property: "count" | "total") => {
     },
     location: {
       available: true,
-      value: { kind: "source-range", source: modulePath, ...link.location },
+      value: {
+        kind: "source-range" as const,
+        source: modulePath,
+        ...link.location,
+      },
     },
     extractor: {
       name: "rea-javascript-artifact-reconstruction",
@@ -120,9 +112,22 @@ const exampleEvidence = (property: "count" | "total") => {
       executable_sha256: null,
     },
     coverage,
-    limitations: ir.limitations,
+    limitations,
     evidence_ids: [],
   };
+};
+
+const buildApplicationNodeAndGraph = (
+  metadata: (typeof captures)["count"],
+  artifact: ReturnType<typeof createWebTextArtifact>,
+  link: NonNullable<
+    ReturnType<typeof analyzeJavaScriptSemantics>["moduleLinks"][number]
+  >,
+  projection: NonNullable<
+    ReturnType<typeof projectJavaScriptExportReturnShapes>
+  >,
+  evidence: ReturnType<typeof createBaseEvidence>,
+) => {
   const exported = createJavaScriptApplicationNode({
     kind: "javascript-module",
     identity: {
@@ -185,6 +190,16 @@ const exampleEvidence = (property: "count" | "total") => {
     coverage: partialApplicationCoverage([], null),
     limitations,
   });
+  return { exported, graph };
+};
+
+const buildSemanticNodeAndGraph = (
+  metadata: (typeof captures)["count"],
+  artifact: ReturnType<typeof createWebTextArtifact>,
+  exported: ReturnType<typeof createJavaScriptApplicationNode>,
+  graph: ReturnType<typeof createJavaScriptApplicationGraph>,
+  evidence: ReturnType<typeof createBaseEvidence>,
+) => {
   const evidenceContexts = new JavaScriptSemanticEvidenceContextRegistry();
   const module = createJavaScriptSemanticGraphNode(
     {
@@ -234,6 +249,48 @@ const exampleEvidence = (property: "count" | "total") => {
     },
     limitations,
   });
+  return { module, semanticGraph };
+};
+
+const exampleEvidence = (property: "count" | "total") => {
+  const metadata = captures[property];
+  const source = `export default () => ({ kind: "results", ${property}: query() });\n`;
+  const artifact = createWebTextArtifact(source, "text/javascript");
+  const ir = analyzeJavaScriptSemantics(source);
+  const link = ir.moduleLinks.find(
+    ({ exportedName }) => exportedName === "default",
+  );
+  if (link === undefined)
+    throw new Error("Example source must define a default export");
+  const coverage =
+    ir.coverage.status === "complete"
+      ? completeApplicationCoverage()
+      : partialApplicationCoverage([], ir.coverage.omittedCount);
+  const projection = projectJavaScriptExportReturnShapes({
+    ir,
+    link,
+    modulePath,
+    baseCoverage: coverage,
+  });
+  if (projection === null)
+    throw new Error("Example export must retain return shapes");
+
+  const evidence = createBaseEvidence(artifact, link, coverage, ir.limitations);
+  const { exported, graph } = buildApplicationNodeAndGraph(
+    metadata,
+    artifact,
+    link,
+    projection,
+    evidence,
+  );
+  const { module, semanticGraph } = buildSemanticNodeAndGraph(
+    metadata,
+    artifact,
+    exported,
+    graph,
+    evidence,
+  );
+
   const result = javascriptApplicationAnalysisResultSchema.parse({
     ...metadata,
     format: "directory",
