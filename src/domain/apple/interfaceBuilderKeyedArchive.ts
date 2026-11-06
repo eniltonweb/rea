@@ -159,6 +159,184 @@ const archiveUid = (value: unknown): number | undefined => {
 const HIERARCHY_KEY =
   /(?:subviews|contentview|childviewcontrollers|children|views)$/iu;
 
+const getClassNameOf = (
+  objectTable: readonly unknown[],
+  value: unknown,
+): string | null => {
+  const classReference = record(value).$class;
+  const uid = archiveUid(classReference);
+  return firstString(
+    record(uid === undefined ? classReference : objectTable[uid]).$classname,
+  );
+};
+
+/** The string an archived string object holds, if it is one. */
+const getArchivedString = (
+  objectTable: readonly unknown[],
+  target: unknown,
+): string | undefined => {
+  if (typeof target === "string") return target;
+  const text = record(target)["NS.string"];
+  return typeof text === "string" &&
+    /^NS(?:Mutable)?String$/u.test(getClassNameOf(objectTable, target) ?? "")
+    ? text
+    : undefined;
+};
+
+const getArchiveText = (
+  objectTable: readonly unknown[],
+  value: unknown,
+): string | null => {
+  const uid = archiveUid(value);
+  return firstString(
+    uid === undefined
+      ? value
+      : getArchivedString(objectTable, objectTable[uid]),
+  );
+};
+
+const getAuthoredId = (
+  objectTable: readonly unknown[],
+  item: Record<string, unknown>,
+): string | null =>
+  firstString(
+    getArchiveText(objectTable, item.objectID),
+    getArchiveText(objectTable, item["object-id"]),
+  );
+
+const resolveArchiveReference = (
+  objectTable: readonly unknown[],
+  uid: number,
+): unknown => {
+  // UID 0 is the archived nil.
+  const target = uid === 0 ? null : objectTable[uid];
+  if (target === undefined || target === null) return null;
+  if (typeof target !== "object") return target;
+  const string = getArchivedString(objectTable, target);
+  if (string !== undefined) return string;
+  const objectId = getAuthoredId(objectTable, record(target));
+  return {
+    archiveUID: uid,
+    ...(objectId === null ? {} : { objectID: objectId }),
+    className: getClassNameOf(objectTable, target),
+  };
+};
+
+/** Resolve one object's own fields, leaving references to other objects as stubs. */
+const resolveArchiveNode = (
+  objectTable: readonly unknown[],
+  value: unknown,
+): unknown => {
+  const uid = archiveUid(value);
+  if (uid !== undefined) return resolveArchiveReference(objectTable, uid);
+  if (Array.isArray(value))
+    return value.map((child) => resolveArchiveNode(objectTable, child));
+  if (typeof value !== "object" || value === null) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "$class") output.className = getClassNameOf(objectTable, value);
+    else output[key] = resolveArchiveNode(objectTable, child);
+  }
+  return output;
+};
+
+const isArchivedArrayClass = (
+  objectTable: readonly unknown[],
+  classReference: unknown,
+): boolean => {
+  const uid = archiveUid(classReference);
+  const descriptor = record(
+    uid === undefined ? classReference : objectTable[uid],
+  );
+  const classNames = Array.isArray(descriptor.$classes)
+    ? descriptor.$classes.filter(
+        (name): name is string => typeof name === "string",
+      )
+    : [];
+  return (
+    classNames.includes("NSArray") || classNames.includes("NSMutableArray")
+  );
+};
+
+const buildArchiveHierarchy = (
+  objectTable: readonly unknown[],
+  start: unknown,
+) => {
+  let omittedReferences = 0;
+  const visited = new Set<number>();
+  const root: unknown[] = [];
+  const pending: { readonly value: unknown; readonly output: unknown[] }[] = [
+    { value: start, output: root },
+  ];
+  const appendNode = (
+    item: Record<string, unknown>,
+    uid: number | undefined,
+    output: unknown[],
+  ): void => {
+    const objectId = firstString(
+      getAuthoredId(objectTable, item),
+      getArchiveText(objectTable, item.id),
+      uid === undefined ? null : String(uid),
+    );
+    if (objectId === null) {
+      for (const [key, child] of Object.entries(item).reverse())
+        if (HIERARCHY_KEY.test(key)) pending.push({ value: child, output });
+      return;
+    }
+    const children: unknown[] = [];
+    output.push({ objectID: objectId, children });
+    for (const [key, child] of Object.entries(item).reverse())
+      if (HIERARCHY_KEY.test(key))
+        pending.push({ value: child, output: children });
+  };
+  while (pending.length > 0) {
+    const entry = pending.pop();
+    if (entry === undefined) break;
+    const { value, output } = entry;
+    const uid = archiveUid(value);
+    if (uid !== undefined) {
+      // UID0 is archived nil, not a missing hierarchy object.
+      if (uid === 0) continue;
+      const target = objectTable[uid];
+      if (target === undefined) {
+        omittedReferences += 1;
+        continue;
+      }
+      if (visited.has(uid)) continue;
+      visited.add(uid);
+      if (Array.isArray(target)) {
+        for (let index = target.length - 1; index >= 0; index -= 1) {
+          const child = target[index];
+          if (child !== undefined) pending.push({ value: child, output });
+        }
+        continue;
+      }
+      if (typeof target !== "object" || target === null) continue;
+      const item = record(target);
+      if (isArchivedArrayClass(objectTable, item.$class)) {
+        const members = item["NS.objects"];
+        if (Array.isArray(members))
+          for (let index = members.length - 1; index >= 0; index -= 1) {
+            const child = members[index];
+            if (child !== undefined) pending.push({ value: child, output });
+          }
+        continue;
+      }
+      appendNode(item, uid, output);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (let index = value.length - 1; index >= 0; index -= 1) {
+        const child = value[index];
+        if (child !== undefined) pending.push({ value: child, output });
+      }
+    } else if (typeof value === "object" && value !== null) {
+      appendNode(record(value), undefined, output);
+    }
+  }
+  return { items: root, omittedReferences };
+};
+
 /**
  * Read an NSKeyedArchiver object table without expanding it into a tree.
  * Archived objects reference each other freely, including cycles such as a
@@ -167,147 +345,10 @@ const HIERARCHY_KEY =
  * names the referenced object; the hierarchy walk visits each object once.
  */
 const keyedArchiveTable = (objectTable: readonly unknown[]) => {
-  const classNameOf = (value: unknown): string | null => {
-    const classReference = record(value).$class;
-    const uid = archiveUid(classReference);
-    return firstString(
-      record(uid === undefined ? classReference : objectTable[uid]).$classname,
-    );
+  return {
+    resolve: (value: unknown) => resolveArchiveNode(objectTable, value),
+    hierarchy: (start: unknown) => buildArchiveHierarchy(objectTable, start),
   };
-  /** The string an archived string object holds, if it is one. */
-  const archivedString = (target: unknown): string | undefined => {
-    if (typeof target === "string") return target;
-    const text = record(target)["NS.string"];
-    return typeof text === "string" &&
-      /^NS(?:Mutable)?String$/u.test(classNameOf(target) ?? "")
-      ? text
-      : undefined;
-  };
-  const text = (value: unknown): string | null => {
-    const uid = archiveUid(value);
-    return firstString(
-      uid === undefined ? value : archivedString(objectTable[uid]),
-    );
-  };
-  const authoredId = (item: Record<string, unknown>): string | null =>
-    firstString(text(item.objectID), text(item["object-id"]));
-  const reference = (uid: number): unknown => {
-    // UID 0 is the archived nil.
-    const target = uid === 0 ? null : objectTable[uid];
-    if (target === undefined || target === null) return null;
-    if (typeof target !== "object") return target;
-    const string = archivedString(target);
-    if (string !== undefined) return string;
-    const objectId = authoredId(record(target));
-    return {
-      archiveUID: uid,
-      ...(objectId === null ? {} : { objectID: objectId }),
-      className: classNameOf(target),
-    };
-  };
-  /** Resolve one object's own fields, leaving references to other objects as stubs. */
-  const resolve = (value: unknown): unknown => {
-    const uid = archiveUid(value);
-    if (uid !== undefined) return reference(uid);
-    if (Array.isArray(value)) return value.map(resolve);
-    if (typeof value !== "object" || value === null) return value;
-    const output: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value)) {
-      if (key === "$class") output.className = classNameOf(value);
-      else output[key] = resolve(child);
-    }
-    return output;
-  };
-  const hierarchy = (start: unknown) => {
-    let omittedReferences = 0;
-    const visited = new Set<number>();
-    const root: unknown[] = [];
-    const pending: { readonly value: unknown; readonly output: unknown[] }[] = [
-      { value: start, output: root },
-    ];
-    const appendNode = (
-      item: Record<string, unknown>,
-      uid: number | undefined,
-      output: unknown[],
-    ): void => {
-      const objectId = firstString(
-        authoredId(item),
-        text(item.id),
-        uid === undefined ? null : String(uid),
-      );
-      if (objectId === null) {
-        for (const [key, child] of Object.entries(item).reverse())
-          if (HIERARCHY_KEY.test(key)) pending.push({ value: child, output });
-        return;
-      }
-      const children: unknown[] = [];
-      output.push({ objectID: objectId, children });
-      for (const [key, child] of Object.entries(item).reverse())
-        if (HIERARCHY_KEY.test(key))
-          pending.push({ value: child, output: children });
-    };
-    while (pending.length > 0) {
-      const entry = pending.pop();
-      if (entry === undefined) break;
-      const { value, output } = entry;
-      const uid = archiveUid(value);
-      if (uid !== undefined) {
-        // UID0 is archived nil, not a missing hierarchy object.
-        if (uid === 0) continue;
-        const target = objectTable[uid];
-        if (target === undefined) {
-          omittedReferences += 1;
-          continue;
-        }
-        if (visited.has(uid)) continue;
-        visited.add(uid);
-        if (Array.isArray(target)) {
-          for (let index = target.length - 1; index >= 0; index -= 1) {
-            const child = target[index];
-            if (child !== undefined) pending.push({ value: child, output });
-          }
-          continue;
-        }
-        if (typeof target !== "object" || target === null) continue;
-        const item = record(target);
-        if (archivedArrayClass(item.$class)) {
-          const members = item["NS.objects"];
-          if (Array.isArray(members))
-            for (let index = members.length - 1; index >= 0; index -= 1) {
-              const child = members[index];
-              if (child !== undefined) pending.push({ value: child, output });
-            }
-          continue;
-        }
-        appendNode(item, uid, output);
-        continue;
-      }
-      if (Array.isArray(value)) {
-        for (let index = value.length - 1; index >= 0; index -= 1) {
-          const child = value[index];
-          if (child !== undefined) pending.push({ value: child, output });
-        }
-      } else if (typeof value === "object" && value !== null) {
-        appendNode(record(value), undefined, output);
-      }
-    }
-    return { items: root, omittedReferences };
-  };
-  const archivedArrayClass = (classReference: unknown): boolean => {
-    const uid = archiveUid(classReference);
-    const descriptor = record(
-      uid === undefined ? classReference : objectTable[uid],
-    );
-    const classNames = Array.isArray(descriptor.$classes)
-      ? descriptor.$classes.filter(
-          (name): name is string => typeof name === "string",
-        )
-      : [];
-    return (
-      classNames.includes("NSArray") || classNames.includes("NSMutableArray")
-    );
-  };
-  return { resolve, hierarchy };
 };
 
 /** Project class and connection objects from an NSKeyedArchiver object table. */
